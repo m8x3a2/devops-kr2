@@ -1,3 +1,4 @@
+# KR2: Bairashny
 import os
 import socket
 

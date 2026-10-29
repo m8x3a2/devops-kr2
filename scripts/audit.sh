@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+PASS=0; FAIL=0
+
+check() {
+    local desc="$1" expected="$2" actual="$3"
+    if [[ "$actual" == "$expected" ]]; then
+        echo "  [OK]   $desc"; ((PASS++))
+    else
+        echo "  [FAIL] $desc (ожидалось: '$expected', получено: '$actual')"; ((FAIL++))
+    fi
+}
+
+echo "Аудит конфигурации: $(hostname -f), $(date '+%Y-%m-%d %H:%M')"
+
+echo "[1] Служба SSH"
+check "Вход от имени root запрещён"        "no" "$(sudo sshd -T | awk '/^permitrootlogin/{print $2}')"
+check "Парольная аутентификация отключена" "no" "$(sudo sshd -T | awk '/^passwordauthentication/{print $2}')"
+
+# TODO 1: значение параметра port отлично от 22
+SSH_PORT="$(sudo sshd -T | awk '/^port /{print $2}')"
+check "Порт SSH отличен от 22 (текущий: ${SSH_PORT:-нет})" "yes" \
+      "$([[ -n "$SSH_PORT" && "$SSH_PORT" != "22" ]] && echo yes || echo no)"
+
+# TODO 2: значение параметра maxauthtries равно 3
+check "MaxAuthTries равно 3" "3" "$(sudo sshd -T | awk '/^maxauthtries/{print $2}')"
+
+echo "[2] Межсетевой экран"
+check "Межсетевой экран активен" "active" "$(sudo ufw status | awk '/^Status:/{print $2}')"
+
+# TODO 3: политика по умолчанию для входящего трафика равна deny
+# строка вида: Default: deny (incoming), allow (outgoing), disabled (routed)
+check "Политика входящего трафика по умолчанию: deny" "deny" \
+      "$(sudo ufw status verbose | awk '/^Default:/{print $2}')"
+
+echo "[3] Учётные записи"
+awk -F: '$3>=1000 && $3<65534 {printf "    %s (uid=%s)\n",$1,$3}' /etc/passwd
+
+echo "[4] Веб-сервер"
+check "Служба nginx активна" "active" "$(systemctl is-active nginx)"
+check "Конфигурация nginx корректна (nginx -t)" "0" \
+      "$(sudo nginx -t > /dev/null 2>&1; echo $?)"
+
+# порог в днях можно переопределить: CERT_DAYS=400 bash audit.sh
+CERT_DAYS="${CERT_DAYS:-30}"
+check "Сертификат действителен ещё не менее ${CERT_DAYS} дн." "0" \
+      "$(openssl x509 -checkend $((CERT_DAYS * 86400)) -noout -in /etc/ssl/certs/devops.crt > /dev/null 2>&1; echo $?)"
+
+# строка вида: <число файлов с записью для всех>/<права ключа>
+WW_COUNT="$(find /var/www/devops-site -perm -o+w 2>/dev/null | wc -l)"
+KEY_MODE="$(sudo stat -c '%a' /etc/ssl/private/devops.key 2>/dev/null)"
+check "Нет файлов с записью для всех, права ключа 600" "0/600" "${WW_COUNT}/${KEY_MODE}"
+
+echo "[5] Контейнеризация"
+check "Служба docker активна" "active" "$(systemctl is-active docker)"
+check "Контейнер PostgreSQL исправен" "healthy" \
+      "$(sudo docker inspect -f '{{.State.Health.Status}}' app-db-1 2>/dev/null || true)"
+PORT_STATUS="$(ss -H -tln | awk '$4 ~ /:(5000|5432)$/ && $4 !~ /^127[.]0[.]0[.]1:/ {bad=1} END {print bad ? "exposed" : "ok"}')"
+check "Порты 5000 и 5432 не доступны на внешних адресах" "ok" "$PORT_STATUS"
+DEVOPS_HOME="$(getent passwd devops | cut -d: -f6)"
+check "Права файла app/.env равны 600" "600" "$(stat -c '%a' "$DEVOPS_HOME/app/.env" 2>/dev/null || true)"
+
+echo "[6] Контрольная работа № 2"
+KR2_HOME="$(getent passwd devops | cut -d: -f6)/kr2"
+REDIS_ID="$(sudo docker compose --project-directory "$KR2_HOME" ps -q redis)"
+check "Redis healthy" "healthy" "$(sudo docker inspect -f '{{.State.Health.Status}}' "$REDIS_ID" 2>/dev/null || true)"
+check "Порт 8002 только на 127.0.0.1" "127.0.0.1:8002" "$(sudo docker compose --project-directory "$KR2_HOME" port app 8002)"
+check "Права kr2/.env равны 600" "600" "$(stat -c %a "$KR2_HOME/.env")"
+check "Сертификат KR2 действителен не менее 30 дней" "0" "$(openssl x509 -checkend 2592000 -noout -in /etc/ssl/certs/kr2.crt >/dev/null 2>&1; echo $?)"
+check "Ресурс KR2 активирован" "yes" "$([ -L /etc/nginx/sites-enabled/kr2 ] && echo yes || echo no)"
+
+echo "Пройдено: $PASS, не пройдено: $FAIL"
+[[ $FAIL -eq 0 ]] && exit 0 || exit 1
